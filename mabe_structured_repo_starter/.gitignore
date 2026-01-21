@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+data/**
+!data/README.md
+!data/.gitkeep
+artifacts/
+submissions/
