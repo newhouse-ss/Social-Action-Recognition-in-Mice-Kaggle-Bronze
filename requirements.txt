@@ -1,9 +1,9 @@
 numpy
 pandas
+polars
+scipy
 scikit-learn
-tqdm
-pyyaml
 lightgbm
 xgboost
 catboost
-torch
+pyarrow

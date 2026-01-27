@@ -1,49 +1,56 @@
-"""Model factories and sklearn wrappers (extracted, best-effort)."""
-
 from __future__ import annotations
 
-# These blocks reference notebook globals such as SEED / USE_GPU.
-# In the refactor, move such values into a config object.
-def _make_lgbm(**kw):
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import lightgbm
+from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.model_selection import StratifiedShuffleSplit
+
+from .config import SEED, USE_GPU
+
+
+def _make_lgbm(*, use_gpu: Optional[bool] = None, **kw) -> lightgbm.LGBMClassifier:
+    use_gpu = USE_GPU if use_gpu is None else use_gpu
     kw.setdefault("random_state", SEED)
-    # kw.setdefault("deterministic", True)
-    # kw.setdefault("force_row_wise", True) 
     kw.setdefault("feature_fraction_seed", SEED)
     kw.setdefault("data_random_seed", SEED)
-    kw.setdefault("device", 'gpu' if USE_GPU else 'cpu')
+    kw.setdefault("device", "gpu" if use_gpu else "cpu")
     return lightgbm.LGBMClassifier(**kw)
 
 
-def _make_xgb(**kw):
+def _make_xgb(*, use_gpu: Optional[bool] = None, **kw) -> XGBClassifier:
+    use_gpu = USE_GPU if use_gpu is None else use_gpu
     kw.setdefault("random_state", SEED)
-    kw.setdefault("tree_method", "gpu_hist" if USE_GPU else "hist")
-    # kw.setdefault("deterministic_histogram", True)
+    kw.setdefault("tree_method", "gpu_hist" if use_gpu else "hist")
     return XGBClassifier(**kw)
 
 
-def _make_cb(**kw):
+def _make_cb(*, use_gpu: Optional[bool] = None, **kw) -> CatBoostClassifier:
+    use_gpu = USE_GPU if use_gpu is None else use_gpu
     kw.setdefault("random_seed", SEED)
-    if USE_GPU:
+    if use_gpu:
         kw.setdefault("task_type", "GPU")
         kw.setdefault("devices", "0")
     else:
         kw.setdefault("task_type", "CPU")
-
     return CatBoostClassifier(**kw)
 
 
-# ================= StratifiedSubsetClassifier =================
-
-
 class StratifiedSubsetClassifierWEval(ClassifierMixin, BaseEstimator):
-    def __init__(self,
-                 estimator,
-                 n_samples=None,
-                 random_state: int = 42,
-                 valid_size: float = 0.10,
-                 val_cap_ratio: float = 0.25,
-                 es_rounds: "int|str" = "auto",
-                 es_metric: str = "auto"):
+    def __init__(
+        self,
+        estimator,
+        n_samples=None,
+        random_state: int = 42,
+        valid_size: float = 0.10,
+        val_cap_ratio: float = 0.25,
+        es_rounds: "int|str" = "auto",
+        es_metric: str = "auto",
+    ):
         self.estimator = estimator
         self.n_samples = (int(n_samples) if (n_samples is not None) else None)
         self.random_state = random_state
@@ -51,62 +58,67 @@ class StratifiedSubsetClassifierWEval(ClassifierMixin, BaseEstimator):
         self.val_cap_ratio = float(val_cap_ratio)
         self.es_rounds = es_rounds
         self.es_metric = es_metric
- 
-    # -------------------------- API --------------------------
+
     def fit(self, X: pd.DataFrame, y):
         y = np.asarray(y)
-        n_total = len(y); assert n_total == len(X)
+        n_total = len(y)
+        assert n_total == len(X)
 
         tr_idx, va_idx = self._compute_train_val_indices(y, n_total)
-        Xtr = X.iloc[tr_idx]; ytr = y[tr_idx]
+        Xtr = X.iloc[tr_idx]
+        ytr = y[tr_idx]
 
         Xtr = Xtr.to_numpy(np.float32, copy=False)
 
         Xva = yva = None
         if va_idx is not None and len(va_idx) > 0:
-            Xva = X.iloc[va_idx].to_numpy(np.float32, copy=False); yva = y[va_idx]
+            Xva = X.iloc[va_idx].to_numpy(np.float32, copy=False)
+            yva = y[va_idx]
 
-        # Compute pos_rate on VALIDATION (what ES monitors)
         pos_rate = None
         if yva is not None and len(yva) > 0:
             pos_rate = float(np.mean(yva == 1))
 
-        # Decide metric & patience
         metric = self._choose_metric(pos_rate)
         patience = self._choose_patience(pos_rate)
 
-        # Apply imbalance knobs per library
         if self._is_xgb(self.estimator):
-            # scale_pos_weight = n_neg / n_pos on TRAIN
             n_pos = max(1, int((ytr == 1).sum()))
             n_neg = max(1, len(ytr) - n_pos)
             self.estimator.set_params(scale_pos_weight=(n_neg / n_pos))
             self.estimator.set_params(eval_metric=metric)
 
         elif self._is_catboost(self.estimator):
-            # GPU-safe auto balancing
-            try: self.estimator.set_params(auto_class_weights="Balanced")
-            except Exception: pass
-            try: self.estimator.set_params(eval_metric=metric)
-            except Exception: pass
+            try:
+                self.estimator.set_params(auto_class_weights="Balanced")
+            except Exception:
+                pass
+            try:
+                self.estimator.set_params(eval_metric=metric)
+            except Exception:
+                pass
 
-        # Fit with ES if we have any validation (single-class OK with Logloss)
         has_valid = (Xva is not None and len(yva) > 0)
         if has_valid and self._is_xgb(self.estimator):
             import xgboost as xgb
+
             self.estimator.fit(
-                Xtr, ytr,
+                Xtr,
+                ytr,
                 eval_set=[(Xva, yva)],
                 verbose=False,
-                callbacks=[xgb.callback.EarlyStopping(
-                    rounds=int(patience),
-                    metric_name=metric,
-                    data_name="validation_0",
-                    save_best=True
-                )]
+                callbacks=[
+                    xgb.callback.EarlyStopping(
+                        rounds=int(patience),
+                        metric_name=metric,
+                        data_name="validation_0",
+                        save_best=True,
+                    )
+                ],
             )
         elif has_valid and self._is_catboost(self.estimator):
             from catboost import Pool
+
             self.estimator.set_params(
                 use_best_model=True,
                 od_type="Iter",
@@ -114,17 +126,19 @@ class StratifiedSubsetClassifierWEval(ClassifierMixin, BaseEstimator):
                 custom_metric=["PRAUC:type=Classic;hints=skip_train~true"],
             )
             self.estimator.fit(
-                Xtr, ytr,
+                Xtr,
+                ytr,
                 eval_set=Pool(Xva, yva),
                 verbose=False,
-                metric_period=50
+                metric_period=50,
             )
         else:
-            # Fall back: train on train split without ES
             self.estimator.fit(Xtr, ytr)
 
         self.classes_ = getattr(self.estimator, "classes_", np.array([0, 1]))
-        self._tr_idx_ = tr_idx; self._va_idx_ = va_idx; self._pos_rate_ = pos_rate
+        self._tr_idx_ = tr_idx
+        self._va_idx_ = va_idx
+        self._pos_rate_ = pos_rate
         return self
 
     def predict_proba(self, X: pd.DataFrame):
@@ -133,23 +147,26 @@ class StratifiedSubsetClassifierWEval(ClassifierMixin, BaseEstimator):
     def predict(self, X: pd.DataFrame):
         return self.estimator.predict(X)
 
-    # -------------------------- helpers --------------------------
     def _compute_train_val_indices(self, y: np.ndarray, n_total: int):
         rng = np.random.default_rng(self.random_state)
         n_classes = np.unique(y).size
 
         def full_data_split():
             if self.valid_size <= 0 or n_classes < 2:
-                idx = rng.permutation(n_total); return idx, None
-            sss = StratifiedShuffleSplit(n_splits=1, test_size=self.valid_size, random_state=self.random_state)
+                idx = rng.permutation(n_total)
+                return idx, None
+            sss = StratifiedShuffleSplit(
+                n_splits=1, test_size=self.valid_size, random_state=self.random_state
+            )
             tr, va = next(sss.split(np.zeros(n_total, dtype=np.int8), y))
             return tr, va
 
         if self.n_samples is None or self.n_samples >= n_total:
             return full_data_split()
 
-        # Use n_samples for train; build val from remainder (capped)
-        sss_tr = StratifiedShuffleSplit(n_splits=1, train_size=self.n_samples, random_state=self.random_state)
+        sss_tr = StratifiedShuffleSplit(
+            n_splits=1, train_size=self.n_samples, random_state=self.random_state
+        )
         tr_idx, rest_idx = next(sss_tr.split(np.zeros(n_total, dtype=np.int8), y))
         remaining = len(rest_idx)
 
@@ -161,7 +178,9 @@ class StratifiedSubsetClassifierWEval(ClassifierMixin, BaseEstimator):
         if remaining < min_val_needed or np.unique(y_rest).size < 2 or self.valid_size <= 0:
             return full_data_split()
 
-        sss_val = StratifiedShuffleSplit(n_splits=1, train_size=want_val, random_state=self.random_state)
+        sss_val = StratifiedShuffleSplit(
+            n_splits=1, train_size=want_val, random_state=self.random_state
+        )
         try:
             va_sel, _ = next(sss_val.split(np.zeros(remaining, dtype=np.int8), y_rest))
         except ValueError:
@@ -181,28 +200,32 @@ class StratifiedSubsetClassifierWEval(ClassifierMixin, BaseEstimator):
         if isinstance(self.es_rounds, int):
             return self.es_rounds
         try:
-            n_estimators = (int(self.estimator.get_params().get("n_estimators", 200))
-                            if self._is_xgb(self.estimator)
-                            else int(self.estimator.get_params().get("iterations", 500)))
+            n_estimators = (
+                int(self.estimator.get_params().get("n_estimators", 200))
+                if self._is_xgb(self.estimator)
+                else int(self.estimator.get_params().get("iterations", 500))
+            )
         except Exception:
             n_estimators = 200
         base = max(30, int(round(0.20 * (n_estimators or 200))))
         if pos_rate is None:
             return base
-        if pos_rate < 0.005:   # <0.5%
+        if pos_rate < 0.005:
             return int(round(base * 1.75))
-        if pos_rate < 0.02:    # <2%
+        if pos_rate < 0.02:
             return int(round(base * 1.40))
         return base
 
     @staticmethod
     def _is_xgb(est):
-        name = est.__class__.__name__.lower(); mod = getattr(est, "__module__", "")
+        name = est.__class__.__name__.lower()
+        mod = getattr(est, "__module__", "")
         return "xgb" in name or "xgboost" in mod or hasattr(est, "get_xgb_params")
 
     @staticmethod
     def _is_catboost(est):
-        name = est.__class__.__name__.lower(); mod = getattr(est, "__module__", "")
+        name = est.__class__.__name__.lower()
+        mod = getattr(est, "__module__", "")
         return "catboost" in name or "catboost" in mod or hasattr(est, "get_all_params")
 
 
@@ -240,9 +263,26 @@ class StratifiedSubsetClassifier(ClassifierMixin, BaseEstimator):
         return self.estimator.predict(X)
 
 
-# ==================== SCORING FUNCTIONS ====================
+def _find_lgbm_step(pipe):
+    try:
+        if "stratifiedsubsetclassifier__estimator" in pipe.get_params():
+            est = pipe.get_params()["stratifiedsubsetclassifier__estimator"]
+            if isinstance(est, lightgbm.LGBMClassifier):
+                return "stratifiedsubsetclassifier"
+        if "stratifiedsubsetclassifierweval__estimator" in pipe.get_params():
+            est = pipe.get_params()["stratifiedsubsetclassifierweval__estimator"]
+            if isinstance(est, lightgbm.LGBMClassifier):
+                return "stratifiedsubsetclassifierweval"
+    except Exception as e:
+        print(e)
+    return None
 
 
-class HostVisibleError(Exception):
-    pass
-
+__all__ = [
+    "StratifiedSubsetClassifier",
+    "StratifiedSubsetClassifierWEval",
+    "_find_lgbm_step",
+    "_make_cb",
+    "_make_lgbm",
+    "_make_xgb",
+]
