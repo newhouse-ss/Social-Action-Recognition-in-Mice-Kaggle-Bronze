@@ -1,558 +1,323 @@
+"""Feature engineering for the CNN-Transformer pipeline.
+
+Converts raw tracking parquet data into per-frame pairwise feature matrices:
+
+  1. Load & pivot tracking data → per-mouse wide DataFrames
+  2. Normalize coordinates (pix_per_cm, arena centering)
+  3. Fill missing values and create validity masks
+  4. Add velocity features (dx/dt, dy/dt per body part)
+  5. Build pairwise features: agent stream | target stream | relative features
+  6. Robust scaling (median / IQR, clipped to [-5, 5])
+"""
+
 from __future__ import annotations
 
 import itertools
+import os
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-
-def safe_rolling(series, window, func, min_periods=None):
-    if min_periods is None:
-        min_periods = max(1, window // 4)
-    return series.rolling(window, min_periods=min_periods, center=True).apply(func, raw=True)
+from .config import DROP_BODY_PARTS
 
 
-def _scale(n_frames_at_30fps, fps, ref=30.0):
-    return max(1, int(round(n_frames_at_30fps * float(fps) / ref)))
+# ---------------------------------------------------------------------------
+# 1. Tracking I/O & pivoting
+# ---------------------------------------------------------------------------
 
 
-def _scale_signed(n_frames_at_30fps, fps, ref=30.0):
-    if n_frames_at_30fps == 0:
-        return 0
-    s = 1 if n_frames_at_30fps > 0 else -1
-    mag = max(1, int(round(abs(n_frames_at_30fps) * float(fps) / ref)))
-    return s * mag
+def load_tracking(path: str) -> pd.DataFrame:
+    """Read a single tracking parquet file."""
+    return pd.read_parquet(path)
 
 
-def _fps_from_meta(meta_df, fallback_lookup, default_fps=30.0):
-    if "frames_per_second" in meta_df.columns and pd.notnull(meta_df["frames_per_second"]).any():
-        return float(meta_df["frames_per_second"].iloc[0])
-    vid = meta_df["video_id"].iloc[0]
-    return float(fallback_lookup.get(vid, default_fps))
+def pivot_mouse_frame(
+    track: pd.DataFrame, all_parts: List[str]
+) -> Dict[int, pd.DataFrame]:
+    """Pivot long-form tracking into per-mouse wide DataFrames.
+
+    Returns:
+        {mouse_id: DataFrame} where each DataFrame is indexed by
+        ``video_frame`` with columns ``x_<part>``, ``y_<part>`` for every
+        body part present.
+    """
+    per_mouse: Dict[int, pd.DataFrame] = {}
+    for mid, grp in track.groupby("mouse_id", sort=False):
+        pv = grp.pivot(index="video_frame", columns="bodypart", values=["x", "y"])
+        pv.columns = [f"{coord}_{part}" for coord, part in pv.columns]
+        pv = pv.sort_index()
+        per_mouse[int(mid)] = pv
+    return per_mouse
 
 
-def _speed(cx: pd.Series, cy: pd.Series, fps: float) -> pd.Series:
-    return np.hypot(cx.diff(), cy.diff()).fillna(0.0) * float(fps)
+# ---------------------------------------------------------------------------
+# 2. Normalize coordinates
+# ---------------------------------------------------------------------------
 
 
-def _roll_future_mean(s: pd.Series, w: int, min_p: int = 1) -> pd.Series:
-    return s.iloc[::-1].rolling(w, min_periods=min_p).mean().iloc[::-1]
-
-
-def _roll_future_var(s: pd.Series, w: int, min_p: int = 2) -> pd.Series:
-    return s.iloc[::-1].rolling(w, min_periods=min_p).var().iloc[::-1]
-
-
-def add_curvature_features(X, center_x, center_y, fps):
-    vel_x = center_x.diff()
-    vel_y = center_y.diff()
-    acc_x = vel_x.diff()
-    acc_y = vel_y.diff()
-
-    cross_prod = vel_x * acc_y - vel_y * acc_x
-    vel_mag = np.sqrt(vel_x**2 + vel_y**2)
-    curvature = np.abs(cross_prod) / (vel_mag**3 + 1e-6)
-
-    for w in [30, 60]:
-        ws = _scale(w, fps)
-        X[f"curv_mean_{w}"] = curvature.rolling(ws, min_periods=max(1, ws // 6)).mean()
-
-    angle = np.arctan2(vel_y, vel_x)
-    angle_change = np.abs(angle.diff())
-    w = 30
-    ws = _scale(w, fps)
-    X[f"turn_rate_{w}"] = angle_change.rolling(ws, min_periods=max(1, ws // 6)).sum()
-
-    return X
-
-
-def add_multiscale_features(X, center_x, center_y, fps):
-    speed = np.sqrt(center_x.diff() ** 2 + center_y.diff() ** 2) * float(fps)
-
-    scales = [10, 40, 160]
-    for scale in scales:
-        ws = _scale(scale, fps)
-        if len(speed) >= ws:
-            X[f"sp_m{scale}"] = speed.rolling(ws, min_periods=max(1, ws // 4)).mean()
-            X[f"sp_s{scale}"] = speed.rolling(ws, min_periods=max(1, ws // 4)).std()
-
-    if len(scales) >= 2 and f"sp_m{scales[0]}" in X.columns and f"sp_m{scales[-1]}" in X.columns:
-        X["sp_ratio"] = X[f"sp_m{scales[0]}"] / (X[f"sp_m{scales[-1]}"] + 1e-6)
-
-    return X
-
-
-def add_state_features(X, center_x, center_y, fps):
-    speed = np.sqrt(center_x.diff() ** 2 + center_y.diff() ** 2) * float(fps)
-    w_ma = _scale(15, fps)
-    speed_ma = speed.rolling(w_ma, min_periods=max(1, w_ma // 3)).mean()
-
-    try:
-        bins = [-np.inf, 0.5 * fps, 2.0 * fps, 5.0 * fps, np.inf]
-        speed_states = pd.cut(speed_ma, bins=bins, labels=[0, 1, 2, 3]).astype(float)
-
-        for window in [60, 120]:
-            ws = _scale(window, fps)
-            if len(speed_states) >= ws:
-                for state in [0, 1, 2, 3]:
-                    X[f"s{state}_{window}"] = (
-                        (speed_states == state)
-                        .astype(float)
-                        .rolling(ws, min_periods=max(1, ws // 6))
-                        .mean()
-                    )
-                state_changes = (speed_states != speed_states.shift(1)).astype(float)
-                X[f"trans_{window}"] = state_changes.rolling(ws, min_periods=max(1, ws // 6)).sum()
-    except Exception:
-        pass
-
-    return X
-
-
-def add_longrange_features(X, center_x, center_y, fps):
-    for window in [120, 240]:
-        ws = _scale(window, fps)
-        if len(center_x) >= ws:
-            X[f"x_ml{window}"] = center_x.rolling(ws, min_periods=max(5, ws // 6)).mean()
-            X[f"y_ml{window}"] = center_y.rolling(ws, min_periods=max(5, ws // 6)).mean()
-
-    for span in [60, 120]:
-        s = _scale(span, fps)
-        X[f"x_e{span}"] = center_x.ewm(span=s, min_periods=1).mean()
-        X[f"y_e{span}"] = center_y.ewm(span=s, min_periods=1).mean()
-
-    speed = np.sqrt(center_x.diff() ** 2 + center_y.diff() ** 2) * float(fps)
-    for window in [60, 120]:
-        ws = _scale(window, fps)
-        if len(speed) >= ws:
-            X[f"sp_pct{window}"] = speed.rolling(ws, min_periods=max(5, ws // 6)).rank(pct=True)
-
-    return X
-
-
-def add_cumulative_distance_single(X, cx, cy, fps, horizon_frames_base: int = 180, colname: str = "path_cum180"):
-    L = max(1, _scale(horizon_frames_base, fps))
-    step = np.hypot(cx.diff(), cy.diff())
-    path = step.rolling(2 * L + 1, min_periods=max(5, L // 6), center=True).sum()
-    X[colname] = path.fillna(0.0).astype(np.float32)
-    return X
-
-
-def add_groom_microfeatures(X, df, fps):
-    parts = df.columns.get_level_values(0)
-    if "body_center" not in parts or "nose" not in parts:
-        return X
-
-    cx = df["body_center"]["x"]
-    cy = df["body_center"]["y"]
-    nx = df["nose"]["x"]
-    ny = df["nose"]["y"]
-
-    cs = (np.sqrt(cx.diff() ** 2 + cy.diff() ** 2) * float(fps)).fillna(0)
-    ns = (np.sqrt(nx.diff() ** 2 + ny.diff() ** 2) * float(fps)).fillna(0)
-
-    w30 = _scale(30, fps)
-    X["head_body_decouple"] = (ns / (cs + 1e-3)).clip(0, 10).rolling(
-        w30, min_periods=max(1, w30 // 3)
-    ).median()
-
-    r = np.sqrt((nx - cx) ** 2 + (ny - cy) ** 2)
-    X["nose_rad_std"] = r.rolling(w30, min_periods=max(1, w30 // 3)).std().fillna(0)
-
-    if "tail_base" in parts:
-        ang = np.arctan2(df["nose"]["y"] - df["tail_base"]["y"], df["nose"]["x"] - df["tail_base"]["x"])
-        dang = np.abs(ang.diff()).fillna(0)
-        X["head_orient_jitter"] = dang.rolling(
-            w30, min_periods=max(1, w30 // 3)
-        ).mean()
-
-    return X
-
-
-def add_interaction_features(X, mouse_pair, avail_A, avail_B, fps):
-    if "body_center" not in avail_A or "body_center" not in avail_B:
-        return X
-
-    rel_x = mouse_pair["A"]["body_center"]["x"] - mouse_pair["B"]["body_center"]["x"]
-    rel_y = mouse_pair["A"]["body_center"]["y"] - mouse_pair["B"]["body_center"]["y"]
-    rel_dist = np.sqrt(rel_x**2 + rel_y**2)
-
-    A_vx = mouse_pair["A"]["body_center"]["x"].diff()
-    A_vy = mouse_pair["A"]["body_center"]["y"].diff()
-    B_vx = mouse_pair["B"]["body_center"]["x"].diff()
-    B_vy = mouse_pair["B"]["body_center"]["y"].diff()
-
-    A_lead = (A_vx * rel_x + A_vy * rel_y) / (np.sqrt(A_vx**2 + A_vy**2) * rel_dist + 1e-6)
-    B_lead = (B_vx * (-rel_x) + B_vy * (-rel_y)) / (
-        np.sqrt(B_vx**2 + B_vy**2) * rel_dist + 1e-6
-    )
-
-    for window in [30, 60]:
-        ws = _scale(window, fps)
-        X[f"A_ld{window}"] = A_lead.rolling(ws, min_periods=max(1, ws // 6)).mean()
-        X[f"B_ld{window}"] = B_lead.rolling(ws, min_periods=max(1, ws // 6)).mean()
-
-    approach = -rel_dist.diff()
-    chase = approach * B_lead
-    w = 30
-    ws = _scale(w, fps)
-    X[f"chase_{w}"] = chase.rolling(ws, min_periods=max(1, ws // 6)).mean()
-
-    for window in [60, 120]:
-        ws = _scale(window, fps)
-        A_sp = np.sqrt(A_vx**2 + A_vy**2)
-        B_sp = np.sqrt(B_vx**2 + B_vy**2)
-        X[f"sp_cor{window}"] = A_sp.rolling(ws, min_periods=max(1, ws // 6)).corr(B_sp)
-
-    return X
-
-
-def add_speed_asymmetry_future_past_single(
-    X: pd.DataFrame, cx: pd.Series, cy: pd.Series, fps: float, horizon_base: int = 30, agg: str = "mean"
+def normalize_coords(
+    df: pd.DataFrame,
+    pix_per_cm: float,
+    width_pix: float,
+    height_pix: float,
 ) -> pd.DataFrame:
-    w = max(3, _scale(horizon_base, fps))
-    v = _speed(cx, cy, fps)
-    if agg == "median":
-        v_past = v.rolling(w, min_periods=max(3, w // 4), center=False).median()
-        v_fut = v.iloc[::-1].rolling(w, min_periods=max(3, w // 4)).median().iloc[::-1]
+    """Convert pixel coordinates to centimeters, centered on the arena."""
+    df = df.copy()
+    x_cols = [c for c in df.columns if c.startswith("x_")]
+    y_cols = [c for c in df.columns if c.startswith("y_")]
+
+    cx = width_pix / 2.0
+    cy = height_pix / 2.0
+
+    for c in x_cols:
+        df[c] = (df[c] - cx) / pix_per_cm
+    for c in y_cols:
+        df[c] = (df[c] - cy) / pix_per_cm
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 3. Fill missing & create masks
+# ---------------------------------------------------------------------------
+
+
+def fill_and_create_masks(df: pd.DataFrame) -> pd.DataFrame:
+    """Forward-fill NaN, backward-fill remainder, and add mask columns.
+
+    For every ``x_<part>`` column, a ``m_x_<part>`` mask column is created:
+    1.0 where the original value was valid, 0.0 where it was missing.
+    """
+    mask_cols = {}
+    for c in df.columns:
+        mask_cols[f"m_{c}"] = df[c].notna().astype(np.float32)
+
+    df = df.ffill().bfill().fillna(0.0)
+
+    for mc, vals in mask_cols.items():
+        df[mc] = vals
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4. Velocity features
+# ---------------------------------------------------------------------------
+
+
+def add_velocities(df: pd.DataFrame, fps: float) -> pd.DataFrame:
+    """Add velocity columns (vx_<part>, vy_<part>) scaled by FPS."""
+    new_cols = {}
+    for c in list(df.columns):
+        if c.startswith("x_"):
+            part = c[2:]
+            new_cols[f"vx_{part}"] = df[c].diff().fillna(0.0) * fps
+        elif c.startswith("y_"):
+            part = c[2:]
+            new_cols[f"vy_{part}"] = df[c].diff().fillna(0.0) * fps
+
+    for k, v in new_cols.items():
+        df[k] = v.astype(np.float32)
+
+    # Also add masked velocity versions
+    for c in list(df.columns):
+        if c.startswith("m_x_"):
+            part = c[4:]
+            df[f"m_vx_{part}"] = df[c]
+        elif c.startswith("m_y_"):
+            part = c[4:]
+            df[f"m_vy_{part}"] = df[c]
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 5. Pairwise feature construction
+# ---------------------------------------------------------------------------
+
+
+def _make_target_prefixed(df: pd.DataFrame) -> pd.DataFrame:
+    """Prefix target-mouse columns with ``t_`` (or ``m_t_`` for masks)."""
+    keep = [
+        c
+        for c in df.columns
+        if c.startswith(("x_", "y_", "vx_", "vy_", "m_x_", "m_y_", "m_vx_", "m_vy_"))
+    ]
+    mapping = {c: ("m_t_" + c[2:] if c.startswith("m_") else "t_" + c) for c in keep}
+    return df[keep].rename(columns=mapping)
+
+
+def build_pairwise_features(
+    per_mouse: Dict[int, pd.DataFrame],
+    allowed_pairs: Optional[List[Tuple[int, int]]] = None,
+) -> pd.DataFrame:
+    """Build feature matrix for all (agent, target) pairs.
+
+    Returns a DataFrame with columns:
+        ``frame``, ``agent_id``, ``target_id``,
+        agent features, target features (``t_`` prefix), and
+        relative features (``rel_dx``, ``rel_dy``, ``rel_dist``).
+    """
+    if not per_mouse:
+        return pd.DataFrame(columns=["frame", "agent_id", "target_id"])
+
+    mice = sorted(per_mouse.keys())
+
+    # Align all mice to common frame index
+    common_idx = per_mouse[mice[0]].index
+    for m in mice[1:]:
+        common_idx = common_idx.intersection(per_mouse[m].index)
+
+    aligned = {m: per_mouse[m].loc[common_idx] for m in mice if m in per_mouse}
+    if not aligned:
+        return pd.DataFrame(columns=["frame", "agent_id", "target_id"])
+
+    if allowed_pairs is not None:
+        pairs = [(a, t) for a, t in allowed_pairs if a in aligned and t in aligned]
+        if not pairs:
+            pairs = list(itertools.product(sorted(aligned), repeat=2))
     else:
-        v_past = v.rolling(w, min_periods=max(3, w // 4), center=False).mean()
-        v_fut = _roll_future_mean(v, w, min_p=max(3, w // 4))
-    X["spd_asym_1s"] = (v_fut - v_past).fillna(0.0)
-    return X
+        pairs = list(itertools.product(sorted(aligned), repeat=2))
+
+    # Find a reference body part for relative features
+    ref_parts = ["nose", "body_center", "neck", "tail_base", "ear_left", "ear_right"]
+
+    rows = []
+    for agent, target in pairs:
+        A = aligned[agent]
+        T = aligned[target]
+        if A.empty or T.empty:
+            continue
+
+        feat = pd.concat([A, _make_target_prefixed(T)], axis=1)
+
+        # Compute relative features from the first available reference part
+        picked = None
+        for p in ref_parts:
+            ax, ay = f"x_{p}", f"y_{p}"
+            if ax in A.columns and ay in A.columns and ax in T.columns and ay in T.columns:
+                picked = p
+                break
+
+        if picked is not None:
+            ax_v = A[f"x_{picked}"].to_numpy()
+            ay_v = A[f"y_{picked}"].to_numpy()
+            tx_v = T[f"x_{picked}"].to_numpy()
+            ty_v = T[f"y_{picked}"].to_numpy()
+            dx = tx_v - ax_v
+            dy = ty_v - ay_v
+            feat = feat.assign(
+                rel_dx=dx, rel_dy=dy, rel_dist=np.sqrt(dx * dx + dy * dy)
+            )
+        else:
+            feat = feat.assign(rel_dx=0.0, rel_dy=0.0, rel_dist=0.0)
+
+        feat["agent_id"] = agent
+        feat["target_id"] = target
+        rows.append(feat)
+
+    if not rows:
+        return pd.DataFrame(columns=["frame", "agent_id", "target_id"])
+
+    out = pd.concat(rows, copy=False).reset_index(names="frame")
+    id_cols = ["frame", "agent_id", "target_id"]
+    feat_cols = [c for c in out.columns if c not in id_cols]
+    return out[id_cols + feat_cols].astype(
+        {c: np.float32 for c in feat_cols}, copy=False
+    )
 
 
-def add_gauss_shift_speed_future_past_single(
-    X: pd.DataFrame, cx: pd.Series, cy: pd.Series, fps: float, window_base: int = 30, eps: float = 1e-6
+# ---------------------------------------------------------------------------
+# 6. Robust scaling
+# ---------------------------------------------------------------------------
+
+
+def compute_scaler(
+    df: pd.DataFrame, feat_cols: List[str]
+) -> Dict[str, Dict[str, float]]:
+    """Compute robust scaler parameters (median and IQR) from training data."""
+    med = df[feat_cols].median().to_dict()
+    q1 = df[feat_cols].quantile(0.25)
+    q3 = df[feat_cols].quantile(0.75)
+    iqr = (q3 - q1).replace(0, 1.0).to_dict()
+    return {"med": med, "iqr": iqr, "clip_low": -5.0, "clip_high": 5.0}
+
+
+def apply_scaler(
+    df: pd.DataFrame, feat_cols: List[str], scaler: Dict
 ) -> pd.DataFrame:
-    w = max(5, _scale(window_base, fps))
-    v = _speed(cx, cy, fps)
-
-    mu_p = v.rolling(w, min_periods=max(3, w // 4)).mean()
-    va_p = v.rolling(w, min_periods=max(3, w // 4)).var().clip(lower=eps)
-
-    mu_f = _roll_future_mean(v, w, min_p=max(3, w // 4))
-    va_f = _roll_future_var(v, w, min_p=max(3, w // 4)).clip(lower=eps)
-
-    kl_pf = 0.5 * ((va_p / va_f) + ((mu_f - mu_p) ** 2) / va_f - 1.0 + np.log(va_f / va_p))
-    kl_fp = 0.5 * ((va_f / va_p) + ((mu_p - mu_f) ** 2) / va_p - 1.0 + np.log(va_p / va_f))
-    X["spd_symkl_1s"] = (kl_pf + kl_fp).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return X
-
-
-def transform_single(single_mouse, body_parts_tracked, fps):
-    available_body_parts = single_mouse.columns.get_level_values(0)
-
-    X = pd.DataFrame(
-        {
-            f"{p1}+{p2}": np.square(single_mouse[p1] - single_mouse[p2]).sum(axis=1, skipna=False)
-            for p1, p2 in itertools.combinations(body_parts_tracked, 2)
-            if p1 in available_body_parts and p2 in available_body_parts
-        }
-    )
-    X = X.reindex(
-        columns=[f"{p1}+{p2}" for p1, p2 in itertools.combinations(body_parts_tracked, 2)],
-        copy=False,
-    )
-
-    if all(p in single_mouse.columns for p in ["ear_left", "ear_right", "tail_base"]):
-        lag = _scale(10, fps)
-        shifted = single_mouse[["ear_left", "ear_right", "tail_base"]].shift(lag)
-        speeds = pd.DataFrame(
-            {
-                "sp_lf": np.square(single_mouse["ear_left"] - shifted["ear_left"]).sum(
-                    axis=1, skipna=False
-                ),
-                "sp_rt": np.square(single_mouse["ear_right"] - shifted["ear_right"]).sum(
-                    axis=1, skipna=False
-                ),
-                "sp_lf2": np.square(single_mouse["ear_left"] - shifted["tail_base"]).sum(
-                    axis=1, skipna=False
-                ),
-                "sp_rt2": np.square(single_mouse["ear_right"] - shifted["tail_base"]).sum(
-                    axis=1, skipna=False
-                ),
-            }
-        )
-        X = pd.concat([X, speeds], axis=1)
-
-    if "nose+tail_base" in X.columns and "ear_left+ear_right" in X.columns:
-        X["elong"] = X["nose+tail_base"] / (X["ear_left+ear_right"] + 1e-6)
-
-    if all(p in available_body_parts for p in ["nose", "body_center", "tail_base"]):
-        v1 = single_mouse["nose"] - single_mouse["body_center"]
-        v2 = single_mouse["tail_base"] - single_mouse["body_center"]
-        X["body_ang"] = (v1["x"] * v2["x"] + v1["y"] * v2["y"]) / (
-            np.sqrt(v1["x"] ** 2 + v1["y"] ** 2)
-            * np.sqrt(v2["x"] ** 2 + v2["y"] ** 2)
-            + 1e-6
-        )
-
-    if "body_center" in available_body_parts:
-        cx = single_mouse["body_center"]["x"]
-        cy = single_mouse["body_center"]["y"]
-
-        for w in [5, 15, 30, 60]:
-            ws = _scale(w, fps)
-            roll = dict(min_periods=1, center=True)
-            X[f"cx_m{w}"] = cx.rolling(ws, **roll).mean()
-            X[f"cy_m{w}"] = cy.rolling(ws, **roll).mean()
-            X[f"cx_s{w}"] = cx.rolling(ws, **roll).std()
-            X[f"cy_s{w}"] = cy.rolling(ws, **roll).std()
-            X[f"x_rng{w}"] = cx.rolling(ws, **roll).max() - cx.rolling(ws, **roll).min()
-            X[f"y_rng{w}"] = cy.rolling(ws, **roll).max() - cy.rolling(ws, **roll).min()
-            X[f"disp{w}"] = np.sqrt(
-                cx.diff().rolling(ws, min_periods=1).sum() ** 2
-                + cy.diff().rolling(ws, min_periods=1).sum() ** 2
-            )
-            X[f"act{w}"] = np.sqrt(
-                cx.diff().rolling(ws, min_periods=1).var()
-                + cy.diff().rolling(ws, min_periods=1).var()
-            )
-
-        X = add_curvature_features(X, cx, cy, fps)
-        X = add_multiscale_features(X, cx, cy, fps)
-        X = add_state_features(X, cx, cy, fps)
-        X = add_longrange_features(X, cx, cy, fps)
-        X = add_cumulative_distance_single(X, cx, cy, fps, horizon_frames_base=180)
-        X = add_groom_microfeatures(X, single_mouse, fps)
-        X = add_speed_asymmetry_future_past_single(X, cx, cy, fps, horizon_base=30)
-        X = add_gauss_shift_speed_future_past_single(X, cx, cy, fps, window_base=30)
-
-    if all(p in available_body_parts for p in ["nose", "tail_base"]):
-        nt_dist = np.sqrt(
-            (single_mouse["nose"]["x"] - single_mouse["tail_base"]["x"]) ** 2
-            + (single_mouse["nose"]["y"] - single_mouse["tail_base"]["y"]) ** 2
-        )
-        for lag in [10, 20, 40]:
-            l = _scale(lag, fps)
-            X[f"nt_lg{lag}"] = nt_dist.shift(l)
-            X[f"nt_df{lag}"] = nt_dist - nt_dist.shift(l)
-
-    if all(p in available_body_parts for p in ["ear_left", "ear_right"]):
-        ear_xy = single_mouse[["ear_left", "ear_right"]]
-        ear_d = np.sqrt(np.square(ear_xy["ear_left"] - ear_xy["ear_right"]).sum(axis=1))
-
-        for off in (-20, -10, 10, 20):
-            X[f"ear_o{off}"] = ear_d.shift(-_scale_signed(off, fps))
-
-        w = _scale(30, fps)
-        roll = ear_d.rolling(w, center=True, min_periods=1)
-        X["ear_con"] = roll.std() / (roll.mean() + 1e-6)
-
-        for w0 in (10, 30, 60):
-            w = _scale(w0, fps)
-            r = ear_d.rolling(w, center=True, min_periods=1)
-
-            X[f"ear_std_{w0}"] = r.std()
-            X[f"ear_range_{w0}"] = r.max() - r.min()
-
-    return X.astype(np.float32, copy=False)
-
-
-def transform_pair(mouse_pair, body_parts_tracked, fps):
-    avail_A = mouse_pair["A"].columns.get_level_values(0)
-    avail_B = mouse_pair["B"].columns.get_level_values(0)
-
-    X = pd.DataFrame(
-        {
-            f"12+{p1}+{p2}": np.square(mouse_pair["A"][p1] - mouse_pair["B"][p2]).sum(
-                axis=1, skipna=False
-            )
-            for p1, p2 in itertools.product(body_parts_tracked, repeat=2)
-            if p1 in avail_A and p2 in avail_B
-        }
-    )
-    X = X.reindex(
-        columns=[f"12+{p1}+{p2}" for p1, p2 in itertools.product(body_parts_tracked, repeat=2)],
-        copy=False,
-    )
-
-    if ("A", "ear_left") in mouse_pair.columns and ("B", "ear_left") in mouse_pair.columns:
-        A_ear = mouse_pair["A"]["ear_left"]
-        B_ear = mouse_pair["B"]["ear_left"]
-
-        for w in [5, 10, 15, 30, 45, 60]:
-            lag = _scale(w, fps)
-
-            shA = A_ear.shift(lag)
-            shB = B_ear.shift(lag)
-
-            dA = A_ear - shA
-            dB = B_ear - shB
-            dAB = A_ear - shB
-
-            speeds = pd.DataFrame(
-                {
-                    f"sp_A_{w}": np.square(dA).sum(axis=1, skipna=False),
-                    f"sp_B_{w}": np.square(dB).sum(axis=1, skipna=False),
-                    f"sp_AB_{w}": np.square(dAB).sum(axis=1, skipna=False),
-                }
-            )
-
-            X = pd.concat([X, speeds], axis=1)
-
-            X[f"sp_diff_AB_{w}"] = speeds[f"sp_A_{w}"] - speeds[f"sp_B_{w}"]
-            X[f"sp_ratio_AB_{w}"] = speeds[f"sp_A_{w}"] / (speeds[f"sp_B_{w}"] + 1e-6)
-
-    if "nose+tail_base" in X.columns and "ear_left+ear_right" in X.columns:
-        X["elong"] = X["nose+tail_base"] / (X["ear_left+ear_right"] + 1e-6)
-
-    if all(p in avail_A for p in ["nose", "tail_base"]) and all(p in avail_B for p in ["nose", "tail_base"]):
-        dir_A = mouse_pair["A"]["nose"] - mouse_pair["A"]["tail_base"]
-        dir_B = mouse_pair["B"]["nose"] - mouse_pair["B"]["tail_base"]
-        X["rel_ori"] = (dir_A["x"] * dir_B["x"] + dir_A["y"] * dir_B["y"]) / (
-            np.sqrt(dir_A["x"] ** 2 + dir_A["y"] ** 2)
-            * np.sqrt(dir_B["x"] ** 2 + dir_B["y"] ** 2)
-            + 1e-6
-        )
-
-    if all(p in avail_A for p in ["nose"]) and all(p in avail_B for p in ["nose"]):
-        cur = np.square(mouse_pair["A"]["nose"] - mouse_pair["B"]["nose"]).sum(axis=1, skipna=False)
-        lag = _scale(10, fps)
-        shA_n = mouse_pair["A"]["nose"].shift(lag)
-        shB_n = mouse_pair["B"]["nose"].shift(lag)
-        past = np.square(shA_n - shB_n).sum(axis=1, skipna=False)
-        X["appr"] = cur - past
-
-    if "body_center" in avail_A and "body_center" in avail_B:
-        cd = np.sqrt(
-            (mouse_pair["A"]["body_center"]["x"] - mouse_pair["B"]["body_center"]["x"]) ** 2
-            + (mouse_pair["A"]["body_center"]["y"] - mouse_pair["B"]["body_center"]["y"]) ** 2
-        )
-        X["v_cls"] = (cd < 5.0).astype(float)
-        X["cls"] = ((cd >= 5.0) & (cd < 15.0)).astype(float)
-        X["med"] = ((cd >= 15.0) & (cd < 30.0)).astype(float)
-        X["far"] = (cd >= 30.0).astype(float)
-
-    if "body_center" in avail_A and "body_center" in avail_B:
-        A = mouse_pair["A"]["body_center"]
-        B = mouse_pair["B"]["body_center"]
-
-        cd_full = ((A - B) ** 2).sum(axis=1, skipna=False)
-
-        dA = A.diff()
-        dB = B.diff()
-
-        coord = (dA * dB).sum(axis=1)
-        As = np.sqrt((dA**2).sum(axis=1))
-        Bs = np.sqrt((dB**2).sum(axis=1))
-
-        vel_cos = (coord / (As * Bs + 1e-9)).clip(-1, 1)
-
-        roll_cfg = dict(min_periods=1, center=True)
-
-        def r(x, ws):
-            return x.rolling(ws, **roll_cfg)
-
-        for w in (5, 15, 30, 60):
-            ws = _scale(w, fps)
-
-            d_var = r(cd_full, ws).var()
-            X[f"int{w}"] = 1 / (1 + d_var)
-
-            X[f"co_m{w}"] = r(coord, ws).mean()
-            X[f"co_s{w}"] = r(coord, ws).std()
-
-            for tag, s in (("A", As), ("B", Bs)):
-                X[f"{tag}_speed_m{w}"] = r(s, ws).mean()
-                X[f"{tag}_speed_s{w}"] = r(s, ws).std()
-
-            X[f"vel_cos_m{w}"] = r(vel_cos, ws).mean()
-            X[f"vel_cos_s{w}"] = r(vel_cos, ws).std()
-
-    if "nose" in avail_A and "nose" in avail_B:
-        nxA, nyA = mouse_pair["A"]["nose"]["x"], mouse_pair["A"]["nose"]["y"]
-        nxB, nyB = mouse_pair["B"]["nose"]["x"], mouse_pair["B"]["nose"]["y"]
-        nn = np.sqrt((nxA - nxB) ** 2 + (nyA - nyB) ** 2)
-
-        is_close = (nn < 10.0).astype(float)
-
-        for lag in [10, 20, 40]:
-            l = _scale(lag, fps)
-
-            sh = nn.shift(l)
-            diff = nn - sh
-
-            X[f"nn_lg{lag}"] = sh
-            X[f"nn_ch{lag}"] = diff
-            X[f"cl_ps{lag}"] = is_close.rolling(l, min_periods=1).mean()
-
-            cl_roll = is_close.rolling(l, min_periods=1)
-            X[f"nn_close_run{lag}"] = cl_roll.sum()
-
-            close_edge = is_close.diff().fillna(0)
-            X[f"nn_enters{lag}"] = (close_edge == 1).rolling(l, min_periods=1).sum()
-            X[f"nn_exits{lag}"] = (close_edge == -1).rolling(l, min_periods=1).sum()
-
-            sh2 = nn.shift(2 * l)
-            X[f"nn_acc{lag}"] = nn - 2 * sh + sh2
-
-    if "nose" in avail_A and "nose" in avail_B:
-        nxA, nyA = mouse_pair["A"]["nose"]["x"], mouse_pair["A"]["nose"]["y"]
-        nxB, nyB = mouse_pair["B"]["nose"]["x"], mouse_pair["B"]["nose"]["y"]
-        nn = np.sqrt((nxA - nxB) ** 2 + (nyA - nyB) ** 2)
-
-        is_close = (nn < 10.0).astype(float)
-
-        for lag in [10, 20, 40]:
-            l = _scale(lag, fps)
-
-            sh1 = nn.shift(l)
-            sh2 = nn.shift(2 * l)
-            diff = nn - sh1
-
-            X[f"nn_approach_rate{lag}"] = (diff < 0).rolling(l, min_periods=1).mean()
-            X[f"nn_approach_strength{lag}"] = (-diff.clip(upper=0)).rolling(
-                l, min_periods=1
-            ).mean()
-
-            close_nn = nn.where(is_close == 1)
-
-            X[f"nn_close_var{lag}"] = close_nn.rolling(l, min_periods=1).var()
-            X[f"nn_close_mean{lag}"] = close_nn.rolling(l, min_periods=1).mean()
-
-            X[f"nn_jitter{lag}"] = diff.abs().rolling(l, min_periods=1).mean()
-
-            acc = nn - 2 * sh1 + sh2
-            X[f"nn_acc_abs{lag}"] = acc.abs().rolling(l, min_periods=1).mean()
-
-    if "body_center" in avail_A and "body_center" in avail_B:
-        Avx = mouse_pair["A"]["body_center"]["x"].diff()
-        Avy = mouse_pair["A"]["body_center"]["y"].diff()
-        Bvx = mouse_pair["B"]["body_center"]["x"].diff()
-        Bvy = mouse_pair["B"]["body_center"]["y"].diff()
-        val = (Avx * Bvx + Avy * Bvy) / (
-            np.sqrt(Avx**2 + Avy**2) * np.sqrt(Bvx**2 + Bvy**2) + 1e-6
-        )
-
-        for off in [-20, -10, 0, 10, 20]:
-            o = _scale_signed(off, fps)
-            X[f"va_{off}"] = val.shift(-o)
-
-        w = _scale(30, fps)
-        X["int_con"] = cd_full.rolling(w, min_periods=1, center=True).std() / (
-            cd_full.rolling(w, min_periods=1, center=True).mean() + 1e-6
-        )
-
-        X = add_interaction_features(X, mouse_pair, avail_A, avail_B, fps)
-
-    return X.astype(np.float32, copy=False)
-
-
-__all__ = [
-    "_fps_from_meta",
-    "_scale",
-    "_scale_signed",
-    "add_curvature_features",
-    "add_gauss_shift_speed_future_past_single",
-    "add_groom_microfeatures",
-    "add_interaction_features",
-    "add_longrange_features",
-    "add_multiscale_features",
-    "add_speed_asymmetry_future_past_single",
-    "add_state_features",
-    "safe_rolling",
-    "transform_pair",
-    "transform_single",
-]
+    """Apply robust scaling: ``(x - median) / IQR``, clipped to [-5, 5]."""
+    df = df.copy()
+    med = pd.Series(scaler["med"], dtype=np.float32)
+    iqr = pd.Series(scaler["iqr"], dtype=np.float32).replace(0, 1.0)
+    low, high = float(scaler.get("clip_low", -5.0)), float(scaler.get("clip_high", 5.0))
+
+    X = df[feat_cols].astype(np.float32)
+    X = (X - med.reindex(feat_cols).fillna(0.0)) / iqr.reindex(feat_cols).fillna(1.0)
+    X = X.clip(low, high).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df[feat_cols] = X.values
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 7. High-level: build features for one video
+# ---------------------------------------------------------------------------
+
+
+def build_video_features(
+    lab_id: str,
+    video_id: int,
+    meta_row: pd.Series,
+    tracking_dir: str,
+) -> pd.DataFrame:
+    """End-to-end feature pipeline for a single video.
+
+    1. Load tracking parquet
+    2. Drop unwanted body parts
+    3. Pivot → per-mouse wide tables
+    4. Normalize coordinates
+    5. Fill missing + create masks
+    6. Add velocities
+    7. Build pairwise features
+
+    Returns:
+        DataFrame with columns ``[frame, agent_id, target_id, video_id, <features…>]``
+    """
+    path = os.path.join(tracking_dir, str(lab_id), f"{video_id}.parquet")
+    track = load_tracking(path)
+    track = track[~track["bodypart"].isin(DROP_BODY_PARTS)].copy()
+
+    fps = float(meta_row.get("frames_per_second", 30.0))
+    ppcm = meta_row.get("pix_per_cm_approx", np.nan)
+    ppcm = float(ppcm) if pd.notna(ppcm) and float(ppcm) != 0 else np.nan
+    w_pix = float(meta_row.get("video_width_pix", np.nan))
+    h_pix = float(meta_row.get("video_height_pix", np.nan))
+
+    # Fallback: estimate pix_per_cm from arena dimensions
+    if not np.isfinite(ppcm):
+        aw = meta_row.get("arena_width_cm", np.nan)
+        ah = meta_row.get("arena_height_cm", np.nan)
+        if (
+            pd.notna(aw) and pd.notna(ah) and float(aw) > 0 and float(ah) > 0
+            and np.isfinite(w_pix) and np.isfinite(h_pix)
+        ):
+            ppcm = ((w_pix / float(aw)) + (h_pix / float(ah))) / 2.0
+    if not np.isfinite(ppcm) or ppcm == 0:
+        ppcm = 1.0
+
+    all_parts = sorted(track["bodypart"].unique().tolist())
+
+    per_mouse = pivot_mouse_frame(track, all_parts)
+    del track
+
+    for m in list(per_mouse):
+        pm = normalize_coords(per_mouse[m], ppcm, w_pix, h_pix)
+        pm = fill_and_create_masks(pm)
+        per_mouse[m] = add_velocities(pm, fps)
+
+    feats = build_pairwise_features(per_mouse)
+    del per_mouse
+
+    feats["video_id"] = int(video_id)
+    return feats

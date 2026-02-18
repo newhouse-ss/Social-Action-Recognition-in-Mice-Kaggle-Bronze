@@ -1,4 +1,11 @@
-from .metrics import mouse_fbeta, score, single_lab_f1
-from .pipeline import run_pipeline
+try:
+    from .model import CNNTransformer
+except ImportError:
+    CNNTransformer = None
 
-__all__ = ["mouse_fbeta", "run_pipeline", "score", "single_lab_f1"]
+try:
+    from .metrics import mouse_fbeta, score, single_lab_f1
+except ImportError:
+    pass
+
+__all__ = ["CNNTransformer"]

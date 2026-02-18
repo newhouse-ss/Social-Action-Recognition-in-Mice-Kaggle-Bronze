@@ -3,7 +3,7 @@ pandas
 polars
 scipy
 scikit-learn
-lightgbm
+torch>=2.0
 xgboost
-catboost
 pyarrow
+matplotlib
