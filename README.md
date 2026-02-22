@@ -16,7 +16,7 @@
 | **Evaluation** | F-beta score, per-lab threshold tuning |
 
 ---
-![MABe Challenge](./data/certificate.png)
+![MABe Challenge](./certificate.png)
 ## Table of Contents
 
 1. [What This Project Does](#what-this-project-does)
