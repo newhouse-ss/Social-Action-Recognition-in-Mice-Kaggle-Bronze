@@ -2,13 +2,27 @@
 
 > **Automatic recognition of 37 social and individual mouse behaviors from pose-tracking data, using a hybrid CNN-Transformer deep learning architecture.**
 
----
+### Tech Stack
 
+| Layer | Technologies |
+|---|---|
+| **Cloud Storage** | Amazon S3 (Raw Zone / Curated Zone, Hive-partitioned Parquet) |
+| **ETL / Data Catalog** | AWS Glue (PySpark), AWS Glue Data Catalog (schema auto-discovery) |
+| **Ad-hoc Querying** | Amazon Athena (SparkSQL), partitioned Parquet on S3 |
+| **BI & Visualization** | Amazon QuickSight, Seaborn, Matplotlib |
+| **Data Ingestion** | boto3 (S3 upload automation) |
+| **Deep Learning** | PyTorch, CNN-Transformer (dilated conv + Transformer encoder) |
+| **Feature Engineering** | PySpark, pandas, numpy (coordinate normalization, velocity, pairwise features) |
+| **Evaluation** | F-beta score, per-lab threshold tuning |
+
+---
+![MABe Challenge](./data/certificate.png)
 ## Table of Contents
 
 1. [What This Project Does](#what-this-project-does)
 2. [Why It Matters](#why-it-matters)
 3. [The Data](#the-data)
+   - [AWS Data Lakehouse Architecture](#aws-data-lakehouse-architecture)
 4. [How the Model Works](#how-the-model-works)
    - [Feature Engineering](#1-feature-engineering)
    - [CNN Backbone](#2-cnn-backbone-local-pattern-extraction)
@@ -23,7 +37,8 @@
    - [Evaluation](#evaluation)
 8. [Full Pipeline Walkthrough](#full-pipeline-walkthrough)
 9. [Evaluation Metric](#evaluation-metric)
-10. [Results](#results)
+10. [Exploratory Data Analysis](#exploratory-data-analysis)
+11. [Results](#results)
 
 ---
 
@@ -82,6 +97,52 @@ Behaviors fall into two groups:
 - **Pair-actions** (26): `approach`, `attack`, `chase`, `sniff`, `mount`, `follow`, etc.
 
 Each lab only annotates a subset of these 37 behaviors, and annotations are specific to certain mouse pairs.
+
+### AWS Data Lakehouse Architecture
+
+All raw data is ingested and processed through a **serverless Data Lakehouse** built on AWS, following a strict Raw → Curated → Analytics tiering:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   AWS Serverless Data Lakehouse                     │
+│                                                                     │
+│  Local data/          boto3            Amazon S3 — Raw Zone         │
+│  ├── train.csv   ─────────────────▶   ├── metadata/train.csv       │
+│  ├── train_tracking/                  ├── train_tracking/           │
+│  └── train_annotation/                │   lab_id=<lab>/*.parquet   │
+│                                       └── train_annotation/         │
+│                                           lab_id=<lab>/*.parquet   │
+│                                                  │                  │
+│                                    AWS Glue Job (PySpark)           │
+│                                    ┌─────────────────────┐          │
+│                                    │ 1. SparkSQL JOIN     │          │
+│                                    │    tracking+metadata │          │
+│                                    │ 2. Normalize coords  │          │
+│                                    │ 3. Velocity features │          │
+│                                    │ 4. Class stats agg   │          │
+│                                    └──────────┬──────────┘          │
+│                                               │                     │
+│                                               ▼                     │
+│                                    Amazon S3 — Curated Zone         │
+│                                    ├── tracking_curated/            │
+│                                    │   lab_id=<lab>/*.parquet       │
+│                                    ├── annotations_enriched/        │
+│                                    └── class_distribution_stats/    │
+│                                               │                     │
+│                              Amazon Athena (SparkSQL ad-hoc)        │
+│                              Amazon QuickSight (BI dashboards)      │
+│                              Seaborn EDA (athena_eda.ipynb)         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+| AWS Service | Role in Pipeline |
+|---|---|
+| **Amazon S3** | Tiered object storage — Raw Zone (landing) and Curated Zone (cleaned, partitioned Parquet) |
+| **AWS Glue Data Catalog** | Automates schema discovery across 19 heterogeneous lab formats |
+| **AWS Glue (PySpark)** | Serverless ETL — coordinate normalization, velocity features, SparkSQL joins & aggregations |
+| **Amazon Athena** | Serverless ad-hoc SQL queries directly on S3 Curated Parquet (no cluster provisioning) |
+| **Amazon QuickSight** | BI dashboards for per-lab behavior distributions and class-imbalance monitoring |
+| **boto3** | Programmatic S3 upload with Hive-style partitioning (`lab_id=<lab>`) |
 
 ---
 
@@ -221,16 +282,27 @@ Raw frame-level probabilities are refined into discrete event intervals:
 │   ├── make_submission.py      #   Run inference and generate submission.csv
 │   └── evaluate.py             #   Score a submission against ground truth
 │
-├── notebook/                   # Exploratory analysis
-│   ├── eda.ipynb               #   Data exploration and visualization
+├── aws_pipeline/               # Serverless ETL & EDA Pipeline (AWS simulation)
+│   ├── config.py               #   S3 bucket/path configs, Spark settings
+│   ├── s3_upload.py            #   Step 1: boto3 upload to S3 Raw Zone
+│   ├── glue_etl.py             #   Step 2: PySpark ETL (AWS Glue simulation)
+│   └── athena_eda.ipynb        #   Step 3: SparkSQL EDA (Athena simulation)
+│
+├── notebook/                   # Exploratory analysis (Seaborn + Matplotlib)
+│   ├── eda.ipynb               #   Data exploration and visualization (Seaborn)
 │   └── mabe.ipynb              #   Experimental notebooks
 │
-├── data/                       # Dataset directory
+├── data/                       # Dataset directory (local raw data)
 │   ├── train.csv               #   Training metadata
 │   ├── test.csv                #   Test metadata
 │   ├── train_tracking/         #   Tracking parquets (train)
 │   ├── test_tracking/          #   Tracking parquets (test)
 │   └── train_annotation/       #   Annotation parquets (train)
+│
+├── s3_mock/                    # Simulated S3 bucket (gitignored, auto-generated)
+│   ├── raw-zone/               #   Landing area for raw uploads
+│   ├── curated-zone/           #   Cleaned & partitioned Parquet output
+│   └── athena-results/         #   Query result spill (isolated)
 │
 ├── docs/                       # Additional documentation
 ├── requirements.txt            # Python dependencies
@@ -288,6 +360,58 @@ Or set the `MABE_DATA_DIR` environment variable to point to your data location:
 
 ```bash
 export MABE_DATA_DIR="/path/to/your/data"
+```
+
+---
+
+## AWS Serverless ETL & EDA Pipeline
+
+The `aws_pipeline/` directory contains a cloud-native **Serverless Data Lakehouse** pipeline that mirrors production AWS services locally:
+
+| Step | Script | AWS Service Simulated | What It Does |
+|---|---|---|---|
+| **1. Ingest** | `s3_upload.py` | Amazon S3 + boto3 | Uploads raw data to S3 Raw Zone (Hive-partitioned by `lab_id`) |
+| **2. Transform** | `glue_etl.py` | AWS Glue (PySpark) | Cleans, normalizes, adds velocity features; writes Curated Parquet |
+| **3. Analyze** | `athena_eda.ipynb` | Amazon Athena (SparkSQL) | Runs ad-hoc SQL queries on Curated Zone; visualizes with Seaborn |
+
+### Running the Pipeline Locally
+
+```bash
+# Step 1: Upload raw data → simulated S3 Raw Zone
+python aws_pipeline/s3_upload.py
+
+# Step 2: Run PySpark ETL (Glue simulation) → Curated Zone
+python aws_pipeline/glue_etl.py
+
+# Step 3: Open the Athena EDA notebook
+jupyter notebook aws_pipeline/athena_eda.ipynb
+```
+
+**Local mode** (default): all S3 paths map to `s3_mock/` on disk — no AWS account needed.
+**Real AWS mode**: set `USE_LOCAL_FS=false` in `aws_pipeline/config.py` and configure `S3_BUCKET` + AWS credentials.
+
+### Data Architecture
+
+```
+data/ (local raw)
+  │
+  ▼  boto3 upload (s3_upload.py)
+s3_mock/raw-zone/                     ← S3 Raw Zone
+  ├── metadata/train.csv, test.csv
+  ├── train_tracking/lab_id=<lab>/    ← Hive-partitioned
+  ├── test_tracking/lab_id=<lab>/
+  └── train_annotation/lab_id=<lab>/
+  │
+  ▼  PySpark ETL (glue_etl.py)
+s3_mock/curated-zone/                 ← S3 Curated Zone
+  ├── metadata_train/                 ← cleaned metadata (Parquet)
+  ├── metadata_test/
+  ├── tracking_curated/lab_id=<lab>/  ← normalized coords + velocity
+  ├── annotations_enriched/lab_id=<lab>/
+  └── class_distribution_stats/       ← aggregated class stats
+  │
+  ▼  SparkSQL queries (athena_eda.ipynb)
+  EDA dashboards & visualizations (Seaborn)
 ```
 
 ---
@@ -419,6 +543,23 @@ The F1 score is:
 3. **Averaged across labs** for the final score
 
 A score of **1.0** means perfect agreement with expert annotations; **0.0** means no correct predictions.
+
+---
+
+## Exploratory Data Analysis
+
+The `notebook/eda.ipynb` notebook provides a comprehensive visual exploration of the dataset using **Seaborn** and Matplotlib, covering:
+
+- **Lab distribution** — video counts per lab, train/test overlap analysis
+- **Video metadata** — FPS, duration, resolution, and mouse-count distributions
+- **Body part tracking schemes** — how tracking configurations vary across labs (4–18 keypoints)
+- **Behavior class imbalance** — frequency and total-frame analysis for all 37 action categories
+- **Event duration analysis** — histograms and per-action median durations
+- **Lab × Action heatmap** — `sns.heatmap` showing which labs annotate which behaviors (log-scaled)
+- **Trajectory visualization** — `sns.lineplot` of mouse body-center paths over time
+- **Data quality audit** — NaN rates across sampled labs
+- **Self vs interaction behaviors** — comparative bar charts with annotated counts
+- **Train vs test comparison** — side-by-side metadata statistics
 
 ---
 

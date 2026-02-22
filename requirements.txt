@@ -7,3 +7,6 @@ torch>=2.0
 xgboost
 pyarrow
 matplotlib
+seaborn
+pyspark>=3.4
+boto3

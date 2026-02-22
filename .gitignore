@@ -31,6 +31,14 @@ checkpoints/
 # Jupyter
 .ipynb_checkpoints/
 
+# S3 mock (local simulation of Data Lake)
+s3_mock/
+
+# Spark
+derby.log
+metastore_db/
+spark-warehouse/
+
 # OS
 .DS_Store
 Thumbs.db
