@@ -13,6 +13,9 @@ build/
 .eggs/
 *.egg
 
+# notebook
+notebook/mabe.ipynb
+
 # Virtual environments
 venv/
 .venv/
