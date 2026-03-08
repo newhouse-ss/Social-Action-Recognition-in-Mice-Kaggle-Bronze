@@ -47,5 +47,3 @@ spark-warehouse/
 .DS_Store
 Thumbs.db
 
-*.zip
-*.7z
